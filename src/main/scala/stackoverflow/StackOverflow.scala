@@ -218,12 +218,14 @@ class StackOverflow extends Serializable {
               f"  distance: ${euclideanDistance(means(idx), newMeans(idx))}%8.0f")
     }
 
+    println(s"""Iteration $iter""")
+
     if (converged(distance))
       newMeans
     else if (iter < kmeansMaxIterations)
       kmeans(newMeans, vectors, iter + 1, debug)
     else {
-      println("Reached max iterations!")
+      println("************ Reached max iterations! - newMeans calculated ***********")
       newMeans
     }
 
@@ -339,14 +341,30 @@ class StackOverflow extends Serializable {
     vectors.cache()
 
     val closest: RDD[(Int, (Int, Int))] = vectors.map(p => (findClosest(p, means), p))
-//    val closestGrouped: RDD[(Int, Iterable[(Int, Int)])] = closest.groupByKey()
+    val closestGrouped: RDD[(Int, Iterable[(Int, Int)])] = closest.groupByKey()
 
-    val langCountArrayMap: RDD[(Int, (Array[Int], ListBuffer[Int], Int))] = calculateLangCountArrayMap(closest)
+    val median = closestGrouped.mapValues { vs => {
+      val groupedByLang: Map[Int, Iterable[(Int, Int)]] = vs.groupBy(v => v._1)
+      val maxLangIterable: (Int, Iterable[(Int, Int)]) = groupedByLang.reduce((a1, a2) => if (a1._2.size > a2._2.size) a1 else a2)
+      val maxLang = maxLangIterable._2.head
+      val langLabel: String = {
+        val maxLangSpread = maxLang._1
+        langs(maxLangSpread / langSpread)
+      } // most common language in the cluster
+      val langPercent: Double = {
+        maxLangIterable._2.size * 100.0 / vs.size
+      } // percent of the questions in the most common language
+      val clusterSize: Int = {
+        vs.size
+      }
+      val medianScore: Int = {
+        val middle: Int = maxLangIterable._2.size/2
+        maxLangIterable._2.toList.sortWith(_._2 < _._2).splitAt(middle)._1.last._2
+      }
 
-    val aggregatedList: RDD[(Int, (Array[Int], ListBuffer[Int], Int))] = aggregateLangCount(langCountArrayMap)
-
-    val median = calculateMedian(aggregatedList)
-
+      (langLabel, langPercent, clusterSize, medianScore)
+    }
+    }
     median.collect().map(_._2).sortBy(_._4)
   }
 
