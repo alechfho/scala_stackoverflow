@@ -198,13 +198,11 @@ class StackOverflow extends Serializable {
 
     vectors.cache()
 
-    val totalClassified: RDD[(Int, (Int, (Int, Int)))] = calculateTotals(means, vectors, langSpread)
+    val clusteredVectors: RDD[(Int, (Int, Int))] = clusterVector(means, vectors);
+    val clusteredVectorList: RDD[(Int, Iterable[(Int, Int)])] = clusteredVectors.groupByKey();
+    val clusterAverages: RDD[(Int, (Int, Int))] = clusteredVectorList.mapValues(vectorList => averageVectors(vectorList))
 
-    val averagedClassified: RDD[(Int, (Int, Int))] = calculateAverages(totalClassified)
-
-    val collectedAveragedClassified: List[(Int, (Int, Int))] = averagedClassified.collect().toList
-
-    updateMean(collectedAveragedClassified, newMeans)
+    clusterAverages.collect().toList.foreach(averaged => newMeans.update(averaged._1, averaged._2))
 
     val distance = euclideanDistance(means, newMeans)
 
@@ -240,35 +238,8 @@ class StackOverflow extends Serializable {
   //
   //
 
-  def updateMean(collectedAveragedClassified: List[(Int, (Int, Int))], newMeans: Array[(Int, Int)]): Unit = {
-    collectedAveragedClassified.foreach(c => newMeans.update(c._1, (c._2._1 * langSpread, c._2._2)))
-  }
-
-  def calculateAverages(totalClassified: RDD[(Int, (Int, (Int, Int)))]): RDD[(Int, (Int, Int))] = {
-    val averagedClassified: RDD[(Int, (Int, Int))] = totalClassified.map(ac => {
-      val clusterIndex = ac._1
-      val accumulatedLangSpreadScore: (Int, (Int, Int)) = ac._2
-      val totalCount = accumulatedLangSpreadScore._1
-      val averageLangSpread = accumulatedLangSpreadScore._2._1 / totalCount
-      val averageLangScore = accumulatedLangSpreadScore._2._2 / totalCount
-      (clusterIndex, (averageLangSpread, averageLangScore))
-    })
-    averagedClassified
-  }
-
-  def calculateTotals(means: Array[(Int, Int)], vectors: RDD[(Int, Int)], langSpread: Int) = {
-    val clusterAssigned: RDD[(Int, (Int, (Int, Int)))] = clusterVector(means, vectors, langSpread)
-    val totalClassified = clusterAssigned.reduceByKey((c1, c2) => {
-      val totalCount = c1._1 + c2._1
-      val totalLangSpread = c1._2._1 + c2._2._1
-      val totalScore = c1._2._2 + c2._2._2
-      (totalCount, (totalLangSpread, totalScore))
-    })
-    totalClassified
-  }
-
-  def clusterVector(means: Array[(Int, Int)], vectors: RDD[(Int, Int)], langSpread: Int) = {
-    val clusterAssigned: RDD[(Int, (Int, (Int, Int)))] = vectors.map(v => (findClosest(v, means), (1, (v._1 / langSpread, v._2))));
+  def clusterVector(means: Array[(Int, Int)], vectors: RDD[(Int, Int)]) = {
+    val clusterAssigned: RDD[(Int, (Int, Int))] = vectors.map(v => (findClosest(v, means), v));
     clusterAssigned
   }
 
@@ -326,8 +297,6 @@ class StackOverflow extends Serializable {
     ((comp1 / count).toInt, (comp2 / count).toInt)
   }
 
-
-
   //
   //
   //  Displaying results:
@@ -343,97 +312,47 @@ class StackOverflow extends Serializable {
     val closest: RDD[(Int, (Int, Int))] = vectors.map(p => (findClosest(p, means), p))
     val closestGrouped: RDD[(Int, Iterable[(Int, Int)])] = closest.groupByKey()
 
-    val median = closestGrouped.mapValues { vs => {
-      val groupedByLang: Map[Int, Iterable[(Int, Int)]] = vs.groupBy(v => v._1)
-      val maxLangIterable: (Int, Iterable[(Int, Int)]) = groupedByLang.reduce((a1, a2) => if (a1._2.size > a2._2.size) a1 else a2)
-      val maxLang = maxLangIterable._2.head
+    val median = calculateMedian(closestGrouped)
+    val clusteredResults = median.collect().map(_._2).sortBy(_._4)
+    clusteredResults
+  }
+
+  def calculateMedian(closestGrouped: RDD[(Int, Iterable[(Int, Int)])]): RDD[(Int, (String, Double, Int, Int))] = {
+    closestGrouped.mapValues { vectorList => {
+      val scoreGroupedByLang: Map[Int, Iterable[(Int, Int)]] = vectorList.groupBy(vector => {
+        val lang = vector._1
+        lang
+      })
+      val maxLangIterable: (Int, Iterable[(Int, Int)]) = scoreGroupedByLang.reduce((scoreList1, scoreList2) => {
+        if (scoreList1._2.size > scoreList2._2.size) {
+          scoreList1
+        } else {
+          scoreList2
+        }
+      })
+      val maxLangSpread = maxLangIterable._1
       val langLabel: String = {
-        val maxLangSpread = maxLang._1
         langs(maxLangSpread / langSpread)
       } // most common language in the cluster
       val langPercent: Double = {
-        maxLangIterable._2.size * 100.0 / vs.size
+        maxLangIterable._2.size * 100.0 / vectorList.size
       } // percent of the questions in the most common language
       val clusterSize: Int = {
-        vs.size
+        vectorList.size
       }
       val medianScore: Int = {
-        val middle: Int = maxLangIterable._2.size/2
-        maxLangIterable._2.toList.sortWith(_._2 < _._2).splitAt(middle)._1.last._2
+        if (maxLangIterable._2.size == 1) {
+          maxLangIterable._2.head._2
+        } else {
+          val s = maxLangIterable._2.map(m => m._2).toList
+          val (lower, upper) = s.sortWith(_<_).splitAt(s.size / 2)
+          if (s.size % 2 == 0) (lower.last + upper.head) / 2 else upper.head
+        }
       }
 
       (langLabel, langPercent, clusterSize, medianScore)
     }
     }
-    median.collect().map(_._2).sortBy(_._4)
-  }
-
-  def findMaxLang(langArray: Array[Int]): (Int, Int) = {
-    var bestIndex = 0
-    var maxCount = 0
-    for(i <- 0 until langArray.size) {
-      if (langArray(i) > maxCount) {
-        maxCount = langArray(i)
-        bestIndex = i
-      }
-    }
-    (bestIndex, maxCount)
-  }
-
-  def calculateMedian(aggregatedList: RDD[(Int, (Array[Int], ListBuffer[Int], Int))]) = {
-    aggregatedList.mapValues { vs => {
-      val langCountArray: Array[Int] = vs._1
-      val totalCount: Int = vs._2.size
-      val langMaxResult: (Int, Int) = findMaxLang(langCountArray)
-      val langLabel: String = {
-        langs(langMaxResult._1)
-      } // most common language in the cluster
-      val langPercent: Double = {
-        langMaxResult._2 * 1.0 / totalCount * 100
-      } // percent of the questions in the most common language
-      val clusterSize: Int = {
-        totalCount
-      }
-      val medianScore: Int = {
-        val halfway = (vs._2.size / 2).toInt
-        val sortedList = vs._2.sorted
-        sortedList(halfway)
-      }
-
-      (langLabel, langPercent, clusterSize, medianScore)
-
-    }
-    }
-  }
-
-  def aggregateLangCount(langCountArrayMap: RDD[(Int, (Array[Int], ListBuffer[Int], Int))]): RDD[(Int, (Array[Int], ListBuffer[Int], Int))] = {
-    val aggregatedList = langCountArrayMap.reduceByKey((c1, c2) => {
-      val accum = c1
-      val langCount: Array[Int] = accum._1
-      val langScores: ListBuffer[Int] = accum._2
-      val lang = accum._3
-
-      langScores ++= c2._2
-
-      val langIndexInt = langIndex(c2._3)
-      langCount(langIndexInt) = langCount(langIndexInt) + c2._1(langIndexInt)
-      (langCount, langScores, lang)
-    })
-    aggregatedList
-  }
-
-  def calculateLangCountArrayMap(closest: RDD[(Int, (Int, Int))]): RDD[(Int, (Array[Int], ListBuffer[Int], Int))] = {
-    val langCountArrayMap: RDD[(Int, ((Array[Int], ListBuffer[Int], Int)))] = closest.map(c => {
-      //create array for the langs
-      //accumulate the counts for the language and total count
-      val clusterId = c._1
-      val langCount = Array.fill[Int](langs.size)(0)
-      val langIndexInt = langIndex(c._2._1)
-      val score = c._2._2
-      langCount(langIndexInt) = 1
-      (clusterId, (langCount, ListBuffer(score), c._2._1))
-    })
-    langCountArrayMap
   }
 
   def printResults(results: Array[(String, Double, Int, Int)]): Unit = {
